@@ -114,16 +114,25 @@ class ArduinoManager:
             self.serial_port = None
             self.last_sent_state = None
 
-    def send_state(self, is_hazard: bool):
+    def send_state(self, state='standby', is_hazard: bool = None):
         """
         Duruma göre Arduino'ya komut iletir:
-        - Baretsiz İhlal (Hazard): '1' (Kırmızı LED + Buzzer)
-        - Güvenli Durum (Safe): '0' (Yeşil LED)
+        - 'hazard' / is_hazard=True  : Baretsiz İhlal -> '1' (Kırmızı LED + Kesikli Buzzer)
+        - 'safe'                     : Baretli Güvenli -> '0' (Yeşil LED)
+        - 'standby' / is_hazard=False: Çalışan Yok / Bekleme -> 'C' (Tüm İkazlar Kapalı)
         """
         if not self.is_connected or not self.serial_port:
             return False
 
-        command_byte = b'1' if is_hazard else b'0'
+        if is_hazard is not None:
+            command_byte = b'1' if is_hazard else b'C'
+        elif state == 'hazard' or state is True or state == '1':
+            command_byte = b'1'
+        elif state == 'safe' or state == '0':
+            command_byte = b'0'
+        else:
+            command_byte = b'C'
+
         current_time = time.time()
 
         # Buffer taşmasını önlemek için durum değiştiğinde veya 1 sn sonra gönder
@@ -171,6 +180,7 @@ class VideoDetectionThread(QThread):
         self.model = None
         self.device = "cpu"
         self.mutex = QMutex()
+        self.tracked_targets = []  # Zamansal kararlılık ve hareket yumuşatma takibi (Debounce Tracker)
 
     def set_confidence(self, conf: float):
         """Güven eşiğini dinamik olarak günceller."""
@@ -256,34 +266,183 @@ class VideoDetectionThread(QThread):
 
             if self.model is not None:
                 try:
+                    # Akıllı ve İSG Öncelikli YOLOv8 Çıkarımı
+                    # agnostic_nms=True ile aynı bölgedeki farklı sınıf kutuları teke indirgenir
                     results = self.model(
                         annotated_frame,
-                        conf=active_conf,
+                        conf=min(active_conf, 0.35),
                         iou=self.iou_threshold,
+                        agnostic_nms=True,
                         verbose=False,
                         device=self.device
                     )
 
                     if results and len(results) > 0:
-                        boxes = results[0].boxes
-                        for box in boxes:
+                        raw_boxes = results[0].boxes
+                        frame_h, frame_w = annotated_frame.shape[:2]
+
+                        candidates = []
+                        for box in raw_boxes:
                             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                             conf = float(box.conf[0])
                             cls_id = int(box.cls[0])
-
-                            # Sınıf ismi kontrolü
                             class_name = self.model.names.get(cls_id, str(cls_id)).lower()
 
-                            # 0: 'head' (Baretsiz) -> KRİTİK İHLAL (#EF4444 Kırmızı)
-                            # 1: 'helmet' (Baretli) / 2: 'hi-viz helmet' -> GÜVENLİ (#22C55E Yeşil)
-                            is_violation = (cls_id == 0 or 'head' in class_name)
-                            is_safe_helmet = (cls_id in (1, 2) or 'helmet' in class_name)
+                            bw = x2 - x1
+                            bh = y2 - y1
 
-                            if is_violation:
+                            # Kenar ve minik arka plan nesne filtresi (Odadaki lamba, köşe askılığı vs.)
+                            if (x1 <= 5 or x2 >= frame_w - 5) and (bw < 50 or bh < 50):
+                                continue
+
+                            # İSG Eşik Mantığı:
+                            # 1. Baretsiz Baş (head, class 0): Daha hassas yakalanmalı (Güvenlik Önceliklidir)
+                            is_head_cand = (cls_id == 0 or 'head' in class_name) and (conf >= max(0.35, active_conf * 0.80))
+
+                            # 2. Baret (helmet / hi-viz helmet, class 1, 2):
+                            # Saç parlaması ve yuvarlak oda nesnelerinden kaynaklanan sahte baretleri engellemek için
+                            # en az 0.68 veya active_conf gereklidir
+                            is_helmet_cand = (cls_id in (1, 2) or 'helmet' in class_name) and (conf >= max(active_conf, 0.68))
+
+                            if is_head_cand:
+                                candidates.append({
+                                    'type': 'head',
+                                    'conf': conf,
+                                    'box': (x1, y1, x2, y2),
+                                    'cls_id': 0
+                                })
+                            elif is_helmet_cand:
+                                candidates.append({
+                                    'type': 'helmet',
+                                    'conf': conf,
+                                    'box': (x1, y1, x2, y2),
+                                    'cls_id': 1
+                                })
+
+                        # Çakışma ve İSG Hakem Mantığı (Spatial Arbitration)
+                        # Aynı bölgede hem kafa hem baret adayı varsa, baret skoru kafadan ezici üstün değilse İHLAL sayılır
+                        final_boxes = []
+                        for i, c1 in enumerate(candidates):
+                            suppressed = False
+                            for j, c2 in enumerate(candidates):
+                                if i == j:
+                                    continue
+                                b1 = c1['box']
+                                b2 = c2['box']
+                                ix1 = max(b1[0], b2[0])
+                                iy1 = max(b1[1], b2[1])
+                                ix2 = min(b1[2], b2[2])
+                                iy2 = min(b1[3], b2[3])
+                                inter_w = max(0, ix2 - ix1)
+                                inter_h = max(0, iy2 - iy1)
+                                inter_area = inter_w * inter_h
+                                if inter_area > 0:
+                                    area1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
+                                    area2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
+                                    overlap = inter_area / float(min(area1, area2))
+                                    if overlap > 0.40:
+                                        # İki aday aynı nesneye ait:
+                                        if c1['type'] == 'helmet' and c2['type'] == 'head':
+                                            # Baret skoru kafadan en az 0.20 yüksek değilse bareti bastır, kafayı (ihlal) seç!
+                                            if c1['conf'] < c2['conf'] + 0.20:
+                                                suppressed = True
+                                                break
+                                        elif c1['type'] == 'head' and c2['type'] == 'helmet':
+                                            if c2['conf'] >= c1['conf'] + 0.20:
+                                                suppressed = True
+                                                break
+                            if not suppressed:
+                                final_boxes.append(c1)
+
+                        # 3. ZAMANSAL KARARLILIK VE HAREKET TAKİPÇİSİ (TEMPORAL DEBOUNCE TRACKER)
+                        # Ani kafa hareketleri ve hareket bulanıklığında (motion blur) titremeyi önler
+                        matched_indices = set()
+                        updated_targets = []
+
+                        for item in final_boxes:
+                            ix1, iy1, ix2, iy2 = item['box']
+                            best_iou = 0.0
+                            best_match = None
+                            best_idx = -1
+
+                            for idx, target in enumerate(self.tracked_targets):
+                                if idx in matched_indices:
+                                    continue
+                                tx1, ty1, tx2, ty2 = target['box']
+                                xx1 = max(ix1, tx1)
+                                yy1 = max(iy1, ty1)
+                                xx2 = min(ix2, tx2)
+                                yy2 = min(iy2, ty2)
+                                iw = max(0, xx2 - xx1)
+                                ih = max(0, yy2 - yy1)
+                                inter = iw * ih
+                                if inter > 0:
+                                    union = (ix2 - ix1) * (iy2 - iy1) + (tx2 - tx1) * (ty2 - ty1) - inter
+                                    iou = inter / float(union) if union > 0 else 0
+                                    if iou > best_iou:
+                                        best_iou = iou
+                                        best_match = target
+                                        best_idx = idx
+
+                            if best_match is not None and best_iou > 0.20:
+                                matched_indices.add(best_idx)
+                                best_match['missed'] = 0
+                                best_match['history'].append(item['type'])
+                                if len(best_match['history']) > 8:
+                                    best_match['history'].pop(0)
+
+                                # Kutu yumuşatma (Jitter / Titreme önleyici Exponential Smoothing)
+                                smooth_box = (
+                                    int(0.65 * ix1 + 0.35 * best_match['box'][0]),
+                                    int(0.65 * iy1 + 0.35 * best_match['box'][1]),
+                                    int(0.65 * ix2 + 0.35 * best_match['box'][2]),
+                                    int(0.65 * iy2 + 0.35 * best_match['box'][3]),
+                                )
+                                best_match['box'] = smooth_box
+                                best_match['conf'] = round(0.70 * item['conf'] + 0.30 * best_match['conf'], 2)
+
+                                # Zamansal Kararlılık Kararı (Histerezis):
+                                # İSG Kuralı: Son 8 karede en az 2 kare kafa görüldüyse -> BARETSİZ
+                                head_votes = best_match['history'].count('head')
+                                helmet_votes = best_match['history'].count('helmet')
+
+                                if head_votes >= 2:
+                                    best_match['type'] = 'head'
+                                elif helmet_votes >= 5:
+                                    best_match['type'] = 'helmet'
+                                # Aksi halde mevcut durumunu korur (ani sıçrama engellenir)
+
+                                updated_targets.append(best_match)
+                            else:
+                                # Yeni tespit edilen hedef
+                                new_target = {
+                                    'box': (ix1, iy1, ix2, iy2),
+                                    'type': item['type'],
+                                    'conf': item['conf'],
+                                    'history': [item['type']],
+                                    'missed': 0
+                                }
+                                updated_targets.append(new_target)
+
+                        # Geçici olarak kaçırılan hedeflere 3 kare tolerans tanı (kırpışmayı önler)
+                        for idx, target in enumerate(self.tracked_targets):
+                            if idx not in matched_indices:
+                                target['missed'] += 1
+                                if target['missed'] <= 3:
+                                    updated_targets.append(target)
+
+                        self.tracked_targets = updated_targets
+
+                        # 4. Kararlı Hedefleri Çizme ve Sayma
+                        for target in self.tracked_targets:
+                            x1, y1, x2, y2 = target['box']
+                            conf = target['conf']
+                            t_type = target['type']
+
+                            if t_type == 'head':
                                 head_count += 1
-                                # OpenCV BGR: Kırmızı #EF4444 -> (68, 68, 239)
-                                box_color = (68, 68, 239)
-                                box_thickness = 3  # Kalın ve belirgin
+                                box_color = (68, 68, 239)  # Kırmızı (#EF4444)
+                                box_thickness = 3
                                 label_text = f"Baretsiz! - %{int(conf * 100)}"
                                 detections.append({
                                     'class_id': 0,
@@ -291,10 +450,9 @@ class VideoDetectionThread(QThread):
                                     'conf': conf,
                                     'box': (x1, y1, x2, y2)
                                 })
-                            elif is_safe_helmet:
+                            else:
                                 helmet_count += 1
-                                # OpenCV BGR: Yeşil #22C55E -> (94, 197, 34)
-                                box_color = (94, 197, 34)
+                                box_color = (94, 197, 34)  # Yeşil (#22C55E)
                                 box_thickness = 2
                                 label_text = f"Baretli - %{int(conf * 100)}"
                                 detections.append({
@@ -303,13 +461,11 @@ class VideoDetectionThread(QThread):
                                     'conf': conf,
                                     'box': (x1, y1, x2, y2)
                                 })
-                            else:
-                                continue
 
                             # Bounding Box Çizimi
                             cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), box_color, box_thickness)
 
-                            # Etiket Arka Plan Rozeti (Okunabilirlik İçin)
+                            # Etiket Arka Plan Rozeti
                             font = cv2.FONT_HERSHEY_SIMPLEX
                             font_scale = 0.55
                             font_thickness = 2
@@ -324,7 +480,6 @@ class VideoDetectionThread(QThread):
                                 box_color,
                                 -1
                             )
-                            # Etiket Metni (Beyaz)
                             cv2.putText(
                                 annotated_frame,
                                 label_text,
@@ -335,6 +490,11 @@ class VideoDetectionThread(QThread):
                                 font_thickness,
                                 cv2.LINE_AA
                             )
+                    else:
+                        # Eğer bu karede hiçbir nesne tespit edilemediyse eski hedefleri yavaşça düşür
+                        for target in self.tracked_targets:
+                            target['missed'] += 1
+                        self.tracked_targets = [t for t in self.tracked_targets if t['missed'] <= 2]
 
                 except Exception as ex:
                     # Model çıkarım hatasını yut ve kamerayı devam ettir
@@ -512,9 +672,9 @@ class MainWindow(QMainWindow):
         right_layout.setContentsMargins(14, 12, 14, 12)
         right_layout.setSpacing(10)
 
-        # GÜVENLİK DURUM BARI (EN ÜSTTE DİKKAT ÇEKİCİ)
-        self.status_bar_banner = QLabel("SAHA GÜVENLİ (BEKLEMEDE)")
-        self.status_bar_banner.setObjectName("bannerSafe")
+        # GÜVENLİK DURUM BARI (EN ÜSTTE DİKKAT ÇEKİCİ - 3 DURUMLU)
+        self.status_bar_banner = QLabel("👁 SAHA İZLENİYOR (BEKLEMEDE)")
+        self.status_bar_banner.setObjectName("bannerStandby")
         self.status_bar_banner.setAlignment(Qt.AlignCenter)
         self.status_bar_banner.setMinimumHeight(44)
         right_layout.addWidget(self.status_bar_banner)
@@ -639,11 +799,11 @@ class MainWindow(QMainWindow):
         ai_layout = QVBoxLayout(ai_group)
 
         slider_layout = QHBoxLayout()
-        self.lbl_conf = QLabel("Güven Eşiği (Conf): %50")
+        self.lbl_conf = QLabel("Güven Eşiği (Conf): %55")
         slider_layout.addWidget(self.lbl_conf)
         self.slider_conf = QSlider(Qt.Horizontal)
         self.slider_conf.setRange(10, 95)
-        self.slider_conf.setValue(50)
+        self.slider_conf.setValue(55)
         self.slider_conf.valueChanged.connect(self._on_conf_changed)
         slider_layout.addWidget(self.slider_conf)
         ai_layout.addLayout(slider_layout)
@@ -773,6 +933,15 @@ class MainWindow(QMainWindow):
             border-radius: 10px;
         }
         /* Güvenlik Durum Barı */
+        QLabel#bannerStandby {
+            background-color: #1E293B;
+            border: 2px solid #38BDF8;
+            color: #E2E8F0;
+            font-size: 15px;
+            font-weight: bold;
+            border-radius: 8px;
+            letter-spacing: 0.5px;
+        }
         QLabel#bannerSafe {
             background-color: #14532D;
             border: 2px solid #22C55E;
@@ -1013,8 +1182,8 @@ class MainWindow(QMainWindow):
         self.video_label.setText("Kamera Akışı Durduruldu")
 
         # Güvenlik durumunu bekleme moduna çek
-        self._set_safe_ui()
-        self.arduino.send_state(is_hazard=False)
+        self._set_standby_ui()
+        self.arduino.send_state('standby')
 
     @pyqtSlot(QImage, int, int, int, list, np.ndarray)
     def on_frame_received(self, q_img, helmet_cnt, head_cnt, total_cnt, detections, raw_frame):
@@ -1034,15 +1203,20 @@ class MainWindow(QMainWindow):
         self.val_head.setText(str(head_cnt))
         self.val_total.setText(str(total_cnt))
 
-        # 3. İhlal Mantığı ve Alarm Tetikleme
-        is_hazard = (head_cnt > 0)
-        self.arduino.send_state(is_hazard=is_hazard)
-
-        if is_hazard:
-            self._trigger_hazard_ui()
+        # 3. İhlal Mantığı ve Alarm Tetikleme (3 Durumlu Profesyonel İSG Hakemi)
+        if head_cnt > 0:
+            # Durum 1: İHLAL (Baretsiz çalışan tespit edildi)
+            self._trigger_hazard_ui(head_cnt)
             self._handle_violation_event(head_cnt, helmet_cnt, detections, raw_frame)
+            self.arduino.send_state('hazard')
+        elif helmet_cnt > 0:
+            # Durum 2: GÜVENLİ (Sadece baretli çalışanlar var, baretsiz yok)
+            self._set_safe_ui(helmet_cnt)
+            self.arduino.send_state('safe')
         else:
-            self._set_safe_ui()
+            # Durum 3: BEKLEME (Saha boş veya tespit edilen çalışan yok)
+            self._set_standby_ui()
+            self.arduino.send_state('standby')
 
     @pyqtSlot(str)
     def on_camera_error(self, message):
@@ -1170,34 +1344,46 @@ class MainWindow(QMainWindow):
     # --------------------------------------------------------------------------
     # ALARM BANNER VE GÜVENLİK DURUMU YÖNETİMİ
     # --------------------------------------------------------------------------
-    def _trigger_hazard_ui(self):
+    def _trigger_hazard_ui(self, count=1):
         """İhlal anında alarm bannerını anında kırmızıya çevirir ve yanıp sönme modunu başlatır."""
+        self.current_hazard_count = count
         if not self.is_flashing:
             self.is_flashing = True
             self.flash_state = True
-            self.status_bar_banner.setText("🚨 DİKKAT! BARETSİZ ÇALIŞAN TESPİT EDİLDİ!")
+            self.status_bar_banner.setText(f"🚨 DİKKAT! BARETSİZ ÇALIŞAN TESPİT EDİLDİ! ({count} Kişi)")
             self.status_bar_banner.setObjectName("bannerViolation1")
             self.status_bar_banner.setStyle(self.status_bar_banner.style())
             self.blink_timer.start()
 
-    def _set_safe_ui(self):
+    def _set_safe_ui(self, count=1):
         """Güvenli durumda bannerı yeşile çeker."""
         if self.is_flashing:
             self.is_flashing = False
             self.blink_timer.stop()
 
-        self.status_bar_banner.setText("✅ SAHA GÜVENLİ")
+        self.status_bar_banner.setText(f"✔ BARETLİ ÇALIŞAN MEVCUT — SAHA GÜVENLİ ({count} Kişi)")
         self.status_bar_banner.setObjectName("bannerSafe")
+        self.status_bar_banner.setStyle(self.status_bar_banner.style())
+
+    def _set_standby_ui(self):
+        """Çalışan olmadığında bannerı bekleme moduna (mavi/gri) çeker."""
+        if self.is_flashing:
+            self.is_flashing = False
+            self.blink_timer.stop()
+
+        self.status_bar_banner.setText("👁 SAHA İZLENİYOR — AKTİF ÇALIŞAN TESPİT EDİLMEDİ")
+        self.status_bar_banner.setObjectName("bannerStandby")
         self.status_bar_banner.setStyle(self.status_bar_banner.style())
 
     def _toggle_blink(self):
         """Yanıp sönen alarm animasyonu."""
         self.flash_state = not self.flash_state
+        cnt = getattr(self, 'current_hazard_count', 1)
         if self.flash_state:
-            self.status_bar_banner.setText("🚨 DİKKAT! BARETSİZ ÇALIŞAN TESPİT EDİLDİ!")
+            self.status_bar_banner.setText(f"🚨 DİKKAT! BARETSİZ ÇALIŞAN TESPİT EDİLDİ! ({cnt} Kişi)")
             self.status_bar_banner.setObjectName("bannerViolation1")
         else:
-            self.status_bar_banner.setText("⚠️ DİKKAT! BARETSİZ ÇALIŞAN TESPİT EDİLDİ!")
+            self.status_bar_banner.setText(f"⚠️ DİKKAT! BARETSİZ ÇALIŞAN TESPİT EDİLDİ! ({cnt} Kişi)")
             self.status_bar_banner.setObjectName("bannerViolation2")
         self.status_bar_banner.setStyle(self.status_bar_banner.style())
 
