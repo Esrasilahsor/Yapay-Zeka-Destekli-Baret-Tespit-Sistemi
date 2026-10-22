@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# İhlal kayıtları ve çıktılar
+ihlal_kayitlari/
+
+# Model dosyaları (büyük olabilir)
+best.pt
