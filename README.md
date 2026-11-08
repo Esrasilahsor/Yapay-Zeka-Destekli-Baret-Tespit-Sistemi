@@ -174,7 +174,7 @@ Model, Roboflow Universe üzerindeki **Hard Hat Universe (v26)** endüstriyel İ
 * **Danışman Öğretim Üyesi:** Doç. Dr. Serhat KILIÇARSLAN  
 * **Kurum:** Bandırma Onyedi Eylül Üniversitesi  
 * **Fakülte:** Mühendislik ve Doğa Bilimleri Fakültesi  
-* **Bölümler:** Bilgisayar Mühendisliği / Yazılım Mühendisliği / Elektrik-Elektronik Mühendisliği  
+* **Bölümler:** Yazılım Mühendisliği / Elektrik-Elektronik Mühendisliği  
 * **Ders:** Veri Bilimi Dersi Proje Grubu (Grup 9)  
 
 ---
