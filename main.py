@@ -158,7 +158,200 @@ class ArduinoManager:
 
 
 # ==============================================================================
-# 2. VİDEO VE YOLOV8 ÇIKARIM İŞ PARÇACIĞI (QTHREAD)
+# 2. KİŞİ BAZLI TAKİP VE KARAR MOTORU (BARETLİ / BARETSİZ / BEKLEME)
+# ==============================================================================
+class HelmetDecisionEngine:
+    """
+    Her kafayı ayrı bir hedef (track) olarak izler ve kararı tek bir kareye göre
+    değil, o kişinin son birkaç karesindeki oylara göre verir.
+
+    Kurallar:
+      1. Görünürlük kapısı: Kafa kadrajın kenarına değiyorsa, çok küçükse veya en-boy
+         oranı normal bir kafaya benzemiyorsa (yarım yüz) o kare OY VERMEZ.
+         Yeterli geçerli oy yoksa kişi BEKLEME'de kalır, alarm üretilmez.
+      2. Simetrik eşik: Baret ve baretsiz için aynı güven eşiği kullanılır.
+         (Eski sürümde baretsiz 0.35, baret 0.68 eşiğiyle değerlendirildiği için
+         sistem kararsız durumları ihlale çeviriyor ve yanlış alarm üretiyordu.)
+      3. Histerezis: Beklemeden karara geçmek için CONFIRM_VOTES, verilmiş bir
+         karardan ters karara geçmek için daha yüksek SWITCH_VOTES oy gerekir.
+         Bu sayede baretli/baretsiz arasında gidip gelme (titreme) engellenir.
+      4. Her kişi bağımsız değerlendirilir; aynı karede birden fazla baretli ve
+         baretsiz kişi aynı anda doğru sayılır.
+    """
+
+    WINDOW = 10            # Kişi başına saklanan son kare sayısı
+    CONFIRM_VOTES = 5      # BEKLEME -> BARETLİ/BARETSİZ için gereken oy
+    SWITCH_VOTES = 7       # BARETLİ <-> BARETSİZ geçişi için gereken oy
+    MIN_VALID_VOTES = 3    # Bunun altında geçerli oy kalırsa kişi BEKLEME'ye döner
+    MAX_MISSED = 12        # Kişi kaç kare görünmezse takipten düşer (~0.4 sn)
+
+    EDGE_MARGIN_RATIO = 0.02   # Kadraj kenarına bu oran kadar yakın kutu = kesik kafa
+    MIN_HEAD_RATIO = 0.06      # Kafa yüksekliği kare yüksekliğinin en az %6'sı olmalı
+    MIN_ASPECT = 0.65          # Kafa kutusu yükseklik/genişlik alt sınırı
+    MAX_ASPECT = 1.90          # Kafa kutusu yükseklik/genişlik üst sınırı
+
+    MATCH_IOU = 0.20           # Aynı kişi eşleştirmesi için en düşük IoU
+    BOX_SMOOTHING = 0.65       # Kutu yumuşatma katsayısı (yeni kutunun ağırlığı)
+
+    def __init__(self):
+        self.tracks = []
+        self._next_id = 1
+
+    def reset(self):
+        self.tracks = []
+        self._next_id = 1
+
+    # ------------------------------------------------------------------
+    # Yardımcılar
+    # ------------------------------------------------------------------
+    @staticmethod
+    def class_type(class_name: str):
+        """Model sınıf adını 'head' / 'helmet' / None olarak eşler (isim tabanlı)."""
+        name = class_name.lower().strip()
+        if 'helmet' in name or 'hardhat' in name or 'hard-hat' in name:
+            # 'no helmet', 'no-helmet' gibi baretsiz adlandırmaları ayır
+            if name.startswith('no') or 'without' in name:
+                return 'head'
+            return 'helmet'
+        if name == 'head' or 'head' in name:
+            return 'head'
+        return None  # person, vest vb. sınıflar karar için kullanılmaz
+
+    @staticmethod
+    def _iou(a, b):
+        ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+        ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        if inter <= 0:
+            return 0.0
+        area_a = (a[2] - a[0]) * (a[3] - a[1])
+        area_b = (b[2] - b[0]) * (b[3] - b[1])
+        union = area_a + area_b - inter
+        return inter / float(union) if union > 0 else 0.0
+
+    @staticmethod
+    def _center_distance_ok(a, b):
+        """Hızlı kafa hareketinde IoU düşse bile merkezler yakınsa aynı kişidir."""
+        acx, acy = (a[0] + a[2]) / 2.0, (a[1] + a[3]) / 2.0
+        bcx, bcy = (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
+        size = max(a[2] - a[0], a[3] - a[1], b[2] - b[0], b[3] - b[1])
+        return ((acx - bcx) ** 2 + (acy - bcy) ** 2) ** 0.5 < 0.6 * size
+
+    def is_fully_visible(self, box, frame_w, frame_h):
+        """Kafa kadrajda tam ve karar verilebilir büyüklükte mi?"""
+        x1, y1, x2, y2 = box
+        bw, bh = x2 - x1, y2 - y1
+        if bw <= 0 or bh <= 0:
+            return False
+        mx = frame_w * self.EDGE_MARGIN_RATIO
+        my = frame_h * self.EDGE_MARGIN_RATIO
+        if x1 <= mx or y1 <= my or x2 >= frame_w - mx or y2 >= frame_h - my:
+            return False  # Kafa kadraj kenarından kesilmiş
+        if bh < frame_h * self.MIN_HEAD_RATIO:
+            return False  # Çok uzak / çok küçük
+        aspect = bh / float(bw)
+        if aspect < self.MIN_ASPECT or aspect > self.MAX_ASPECT:
+            return False  # Yarım yüz / sadece alt yüz gibi kafa oranına uymayan kutu
+        return True
+
+    # ------------------------------------------------------------------
+    # Ana güncelleme
+    # ------------------------------------------------------------------
+    def update(self, detections, frame_w, frame_h, conf_threshold):
+        """
+        detections: [{'type': 'head'|'helmet', 'conf': float, 'box': (x1,y1,x2,y2)}, ...]
+        Dönüş: güncel takip listesi. Her takipte 'state' alanı
+               'head' (baretsiz), 'helmet' (baretli) veya 'pending' (bekleme) olur.
+        """
+        # 1) Eşleştirme: tüm (takip, tespit) çiftlerini IoU'ya göre sırala, en iyiyi önce eşle
+        pairs = []
+        for ti, track in enumerate(self.tracks):
+            for di, det in enumerate(detections):
+                iou = self._iou(track['box'], det['box'])
+                if iou >= self.MATCH_IOU or self._center_distance_ok(track['box'], det['box']):
+                    pairs.append((iou, ti, di))
+        pairs.sort(key=lambda p: p[0], reverse=True)
+
+        used_tracks, used_dets = set(), set()
+        assignments = []
+        for _, ti, di in pairs:
+            if ti in used_tracks or di in used_dets:
+                continue
+            used_tracks.add(ti)
+            used_dets.add(di)
+            assignments.append((ti, di))
+
+        existing_count = len(self.tracks)
+
+        # 2) Eşleşen takipleri güncelle
+        for ti, di in assignments:
+            track, det = self.tracks[ti], detections[di]
+            a = self.BOX_SMOOTHING
+            track['box'] = tuple(int(a * n + (1 - a) * o) for n, o in zip(det['box'], track['box']))
+            track['missed'] = 0
+            self._push_vote(track, det, frame_w, frame_h, conf_threshold)
+
+        # 3) Eşleşmeyen tespitlerden yeni takip aç
+        for di, det in enumerate(detections):
+            if di in used_dets:
+                continue
+            track = {
+                'id': self._next_id,
+                'box': tuple(det['box']),
+                'state': 'pending',
+                'votes': [],
+                'missed': 0,
+            }
+            self._next_id += 1
+            self._push_vote(track, det, frame_w, frame_h, conf_threshold)
+            self.tracks.append(track)
+
+        # 4) Görünmeyen takipler: kısa süre tolerans, sonra düşür
+        for ti in range(existing_count):
+            if ti not in used_tracks:
+                self.tracks[ti]['missed'] += 1
+        self.tracks = [t for t in self.tracks if t['missed'] <= self.MAX_MISSED]
+
+        # 5) Her takip için kararı güncelle
+        for track in self.tracks:
+            self._decide(track)
+        return self.tracks
+
+    def _push_vote(self, track, det, frame_w, frame_h, conf_threshold):
+        valid = det['conf'] >= conf_threshold and self.is_fully_visible(det['box'], frame_w, frame_h)
+        track['votes'].append((det['type'], det['conf']) if valid else (None, 0.0))
+        if len(track['votes']) > self.WINDOW:
+            track['votes'].pop(0)
+
+    def _decide(self, track):
+        votes = [v for v, _ in track['votes']]
+        head_votes = votes.count('head')
+        helmet_votes = votes.count('helmet')
+        state = track['state']
+
+        if head_votes + helmet_votes < self.MIN_VALID_VOTES:
+            # Kafa tam görünmüyor / güven düşük -> karar verme, beklemede kal
+            track['state'] = 'pending'
+        elif state == 'pending':
+            if head_votes >= self.CONFIRM_VOTES and head_votes > helmet_votes:
+                track['state'] = 'head'
+            elif helmet_votes >= self.CONFIRM_VOTES and helmet_votes > head_votes:
+                track['state'] = 'helmet'
+        elif state == 'head' and helmet_votes >= self.SWITCH_VOTES:
+            track['state'] = 'helmet'
+        elif state == 'helmet' and head_votes >= self.SWITCH_VOTES:
+            track['state'] = 'head'
+
+        # Ekranda gösterilecek güven: karar verilen sınıfın penceredeki ortalama güveni
+        if track['state'] in ('head', 'helmet'):
+            confs = [c for v, c in track['votes'] if v == track['state']]
+            track['conf'] = sum(confs) / len(confs) if confs else 0.0
+        else:
+            track['conf'] = 0.0
+
+
+# ==============================================================================
+# 3. VİDEO VE YOLOV8 ÇIKARIM İŞ PARÇACIĞI (QTHREAD)
 # ==============================================================================
 class VideoDetectionThread(QThread):
     """
@@ -180,7 +373,8 @@ class VideoDetectionThread(QThread):
         self.model = None
         self.device = "cpu"
         self.mutex = QMutex()
-        self.tracked_targets = []  # Zamansal kararlılık ve hareket yumuşatma takibi (Debounce Tracker)
+        self.decision_engine = HelmetDecisionEngine()  # Kişi bazlı takip + bekleme + histerezis kararı
+        self._inference_error_reported = False
 
     def set_confidence(self, conf: float):
         """Güven eşiğini dinamik olarak günceller."""
@@ -266,239 +460,106 @@ class VideoDetectionThread(QThread):
 
             if self.model is not None:
                 try:
-                    # Akıllı ve İSG Öncelikli YOLOv8 Çıkarımı
-                    # agnostic_nms=True ile aynı bölgedeki farklı sınıf kutuları teke indirgenir
+                    # YOLOv8 çıkarımı: Kişinin takipte kalması için modele biraz daha düşük
+                    # bir taban eşikle sorulur; karar oyları ise yalnızca active_conf ve
+                    # üzerindeki tespitlerden gelir (HelmetDecisionEngine._push_vote).
+                    # agnostic_nms=True: aynı kafa üzerindeki baret/kafa kutularından
+                    # yalnızca skoru yüksek olan kalır (simetrik eleme).
                     results = self.model(
                         annotated_frame,
-                        conf=min(active_conf, 0.35),
+                        conf=max(0.20, active_conf * 0.6),
                         iou=self.iou_threshold,
                         agnostic_nms=True,
                         verbose=False,
                         device=self.device
                     )
 
+                    frame_h, frame_w = annotated_frame.shape[:2]
+                    raw_detections = []
                     if results and len(results) > 0:
-                        raw_boxes = results[0].boxes
-                        frame_h, frame_w = annotated_frame.shape[:2]
-
-                        candidates = []
-                        for box in raw_boxes:
-                            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                            conf = float(box.conf[0])
+                        for box in results[0].boxes:
                             cls_id = int(box.cls[0])
-                            class_name = self.model.names.get(cls_id, str(cls_id)).lower()
-
-                            bw = x2 - x1
-                            bh = y2 - y1
-
-                            # Kenar ve minik arka plan nesne filtresi (Odadaki lamba, köşe askılığı vs.)
-                            if (x1 <= 5 or x2 >= frame_w - 5) and (bw < 50 or bh < 50):
+                            class_name = str(self.model.names.get(cls_id, cls_id))
+                            det_type = HelmetDecisionEngine.class_type(class_name)
+                            if det_type is None:
                                 continue
+                            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                            raw_detections.append({
+                                'type': det_type,
+                                'conf': float(box.conf[0]),
+                                'box': (x1, y1, x2, y2),
+                            })
 
-                            # İSG Eşik Mantığı:
-                            # 1. Baretsiz Baş (head, class 0): Daha hassas yakalanmalı (Güvenlik Önceliklidir)
-                            is_head_cand = (cls_id == 0 or 'head' in class_name) and (conf >= max(0.35, active_conf * 0.80))
+                    tracks = self.decision_engine.update(raw_detections, frame_w, frame_h, active_conf)
 
-                            # 2. Baret (helmet / hi-viz helmet, class 1, 2):
-                            # Saç parlaması ve yuvarlak oda nesnelerinden kaynaklanan sahte baretleri engellemek için
-                            # en az 0.68 veya active_conf gereklidir
-                            is_helmet_cand = (cls_id in (1, 2) or 'helmet' in class_name) and (conf >= max(active_conf, 0.68))
+                    # Kararlı hedefleri çiz ve say
+                    for target in tracks:
+                        x1, y1, x2, y2 = target['box']
+                        conf = target['conf']
+                        state = target['state']
 
-                            if is_head_cand:
-                                candidates.append({
-                                    'type': 'head',
-                                    'conf': conf,
-                                    'box': (x1, y1, x2, y2),
-                                    'cls_id': 0
-                                })
-                            elif is_helmet_cand:
-                                candidates.append({
-                                    'type': 'helmet',
-                                    'conf': conf,
-                                    'box': (x1, y1, x2, y2),
-                                    'cls_id': 1
-                                })
+                        if state == 'head':
+                            head_count += 1
+                            box_color = (68, 68, 239)  # Kırmızı (#EF4444)
+                            box_thickness = 3
+                            label_text = f"Baretsiz! - %{int(conf * 100)}"
+                            detections.append({
+                                'class_id': 0,
+                                'label': 'Baretsiz',
+                                'conf': conf,
+                                'box': (x1, y1, x2, y2)
+                            })
+                        elif state == 'helmet':
+                            helmet_count += 1
+                            box_color = (94, 197, 34)  # Yeşil (#22C55E)
+                            box_thickness = 2
+                            label_text = f"Baretli - %{int(conf * 100)}"
+                            detections.append({
+                                'class_id': 1,
+                                'label': 'Baretli',
+                                'conf': conf,
+                                'box': (x1, y1, x2, y2)
+                            })
+                        else:
+                            # BEKLEME: kafa tam görünmüyor veya karar için yeterli kare yok.
+                            # Sayılmaz, alarm üretmez; sadece ince gri kutu ile gösterilir.
+                            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (150, 150, 150), 1)
+                            continue
 
-                        # Çakışma ve İSG Hakem Mantığı (Spatial Arbitration)
-                        # Aynı bölgede hem kafa hem baret adayı varsa, baret skoru kafadan ezici üstün değilse İHLAL sayılır
-                        final_boxes = []
-                        for i, c1 in enumerate(candidates):
-                            suppressed = False
-                            for j, c2 in enumerate(candidates):
-                                if i == j:
-                                    continue
-                                b1 = c1['box']
-                                b2 = c2['box']
-                                ix1 = max(b1[0], b2[0])
-                                iy1 = max(b1[1], b2[1])
-                                ix2 = min(b1[2], b2[2])
-                                iy2 = min(b1[3], b2[3])
-                                inter_w = max(0, ix2 - ix1)
-                                inter_h = max(0, iy2 - iy1)
-                                inter_area = inter_w * inter_h
-                                if inter_area > 0:
-                                    area1 = (b1[2] - b1[0]) * (b1[3] - b1[1])
-                                    area2 = (b2[2] - b2[0]) * (b2[3] - b2[1])
-                                    overlap = inter_area / float(min(area1, area2))
-                                    if overlap > 0.40:
-                                        # İki aday aynı nesneye ait:
-                                        if c1['type'] == 'helmet' and c2['type'] == 'head':
-                                            # Baret skoru kafadan en az 0.20 yüksek değilse bareti bastır, kafayı (ihlal) seç!
-                                            if c1['conf'] < c2['conf'] + 0.20:
-                                                suppressed = True
-                                                break
-                                        elif c1['type'] == 'head' and c2['type'] == 'helmet':
-                                            if c2['conf'] >= c1['conf'] + 0.20:
-                                                suppressed = True
-                                                break
-                            if not suppressed:
-                                final_boxes.append(c1)
+                        # Bounding Box Çizimi
+                        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), box_color, box_thickness)
 
-                        # 3. ZAMANSAL KARARLILIK VE HAREKET TAKİPÇİSİ (TEMPORAL DEBOUNCE TRACKER)
-                        # Ani kafa hareketleri ve hareket bulanıklığında (motion blur) titremeyi önler
-                        matched_indices = set()
-                        updated_targets = []
+                        # Etiket Arka Plan Rozeti
+                        font = cv2.FONT_HERSHEY_SIMPLEX
+                        font_scale = 0.55
+                        font_thickness = 2
+                        (txt_w, txt_h), baseline = cv2.getTextSize(label_text, font, font_scale, font_thickness)
 
-                        for item in final_boxes:
-                            ix1, iy1, ix2, iy2 = item['box']
-                            best_iou = 0.0
-                            best_match = None
-                            best_idx = -1
-
-                            for idx, target in enumerate(self.tracked_targets):
-                                if idx in matched_indices:
-                                    continue
-                                tx1, ty1, tx2, ty2 = target['box']
-                                xx1 = max(ix1, tx1)
-                                yy1 = max(iy1, ty1)
-                                xx2 = min(ix2, tx2)
-                                yy2 = min(iy2, ty2)
-                                iw = max(0, xx2 - xx1)
-                                ih = max(0, yy2 - yy1)
-                                inter = iw * ih
-                                if inter > 0:
-                                    union = (ix2 - ix1) * (iy2 - iy1) + (tx2 - tx1) * (ty2 - ty1) - inter
-                                    iou = inter / float(union) if union > 0 else 0
-                                    if iou > best_iou:
-                                        best_iou = iou
-                                        best_match = target
-                                        best_idx = idx
-
-                            if best_match is not None and best_iou > 0.20:
-                                matched_indices.add(best_idx)
-                                best_match['missed'] = 0
-                                best_match['history'].append(item['type'])
-                                if len(best_match['history']) > 8:
-                                    best_match['history'].pop(0)
-
-                                # Kutu yumuşatma (Jitter / Titreme önleyici Exponential Smoothing)
-                                smooth_box = (
-                                    int(0.65 * ix1 + 0.35 * best_match['box'][0]),
-                                    int(0.65 * iy1 + 0.35 * best_match['box'][1]),
-                                    int(0.65 * ix2 + 0.35 * best_match['box'][2]),
-                                    int(0.65 * iy2 + 0.35 * best_match['box'][3]),
-                                )
-                                best_match['box'] = smooth_box
-                                best_match['conf'] = round(0.70 * item['conf'] + 0.30 * best_match['conf'], 2)
-
-                                # Zamansal Kararlılık Kararı (Histerezis):
-                                # İSG Kuralı: Son 8 karede en az 2 kare kafa görüldüyse -> BARETSİZ
-                                head_votes = best_match['history'].count('head')
-                                helmet_votes = best_match['history'].count('helmet')
-
-                                if head_votes >= 2:
-                                    best_match['type'] = 'head'
-                                elif helmet_votes >= 5:
-                                    best_match['type'] = 'helmet'
-                                # Aksi halde mevcut durumunu korur (ani sıçrama engellenir)
-
-                                updated_targets.append(best_match)
-                            else:
-                                # Yeni tespit edilen hedef
-                                new_target = {
-                                    'box': (ix1, iy1, ix2, iy2),
-                                    'type': item['type'],
-                                    'conf': item['conf'],
-                                    'history': [item['type']],
-                                    'missed': 0
-                                }
-                                updated_targets.append(new_target)
-
-                        # Geçici olarak kaçırılan hedeflere 3 kare tolerans tanı (kırpışmayı önler)
-                        for idx, target in enumerate(self.tracked_targets):
-                            if idx not in matched_indices:
-                                target['missed'] += 1
-                                if target['missed'] <= 3:
-                                    updated_targets.append(target)
-
-                        self.tracked_targets = updated_targets
-
-                        # 4. Kararlı Hedefleri Çizme ve Sayma
-                        for target in self.tracked_targets:
-                            x1, y1, x2, y2 = target['box']
-                            conf = target['conf']
-                            t_type = target['type']
-
-                            if t_type == 'head':
-                                head_count += 1
-                                box_color = (68, 68, 239)  # Kırmızı (#EF4444)
-                                box_thickness = 3
-                                label_text = f"Baretsiz! - %{int(conf * 100)}"
-                                detections.append({
-                                    'class_id': 0,
-                                    'label': 'Baretsiz',
-                                    'conf': conf,
-                                    'box': (x1, y1, x2, y2)
-                                })
-                            else:
-                                helmet_count += 1
-                                box_color = (94, 197, 34)  # Yeşil (#22C55E)
-                                box_thickness = 2
-                                label_text = f"Baretli - %{int(conf * 100)}"
-                                detections.append({
-                                    'class_id': 1,
-                                    'label': 'Baretli',
-                                    'conf': conf,
-                                    'box': (x1, y1, x2, y2)
-                                })
-
-                            # Bounding Box Çizimi
-                            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), box_color, box_thickness)
-
-                            # Etiket Arka Plan Rozeti
-                            font = cv2.FONT_HERSHEY_SIMPLEX
-                            font_scale = 0.55
-                            font_thickness = 2
-                            (txt_w, txt_h), baseline = cv2.getTextSize(label_text, font, font_scale, font_thickness)
-                            
-                            badge_y1 = max(0, y1 - txt_h - 10)
-                            badge_y2 = y1
-                            cv2.rectangle(
-                                annotated_frame,
-                                (x1, badge_y1),
-                                (x1 + txt_w + 10, badge_y2),
-                                box_color,
-                                -1
-                            )
-                            cv2.putText(
-                                annotated_frame,
-                                label_text,
-                                (x1 + 5, y1 - 4),
-                                font,
-                                font_scale,
-                                (255, 255, 255),
-                                font_thickness,
-                                cv2.LINE_AA
-                            )
-                    else:
-                        # Eğer bu karede hiçbir nesne tespit edilemediyse eski hedefleri yavaşça düşür
-                        for target in self.tracked_targets:
-                            target['missed'] += 1
-                        self.tracked_targets = [t for t in self.tracked_targets if t['missed'] <= 2]
+                        badge_y1 = max(0, y1 - txt_h - 10)
+                        badge_y2 = y1
+                        cv2.rectangle(
+                            annotated_frame,
+                            (x1, badge_y1),
+                            (x1 + txt_w + 10, badge_y2),
+                            box_color,
+                            -1
+                        )
+                        cv2.putText(
+                            annotated_frame,
+                            label_text,
+                            (x1 + 5, y1 - 4),
+                            font,
+                            font_scale,
+                            (255, 255, 255),
+                            font_thickness,
+                            cv2.LINE_AA
+                        )
 
                 except Exception as ex:
-                    # Model çıkarım hatasını yut ve kamerayı devam ettir
-                    pass
+                    # Çıkarım hatası kamerayı durdurmaz, ancak sessizce yutulmaz
+                    if not self._inference_error_reported:
+                        self._inference_error_reported = True
+                        self.status_updated.emit(f"⚠️ Model çıkarım hatası: {ex}")
 
             total_count = helmet_count + head_count
 
@@ -543,7 +604,7 @@ class VideoDetectionThread(QThread):
 
 
 # ==============================================================================
-# 3. ANA ARAYÜZ PENCERESİ (MODERN ENDÜSTRİYEL KONTROL KONSOLU)
+# 4. ANA ARAYÜZ PENCERESİ (MODERN ENDÜSTRİYEL KONTROL KONSOLU)
 # ==============================================================================
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -1449,7 +1510,7 @@ class MainWindow(QMainWindow):
 
 
 # ==============================================================================
-# 4. UYGULAMA GİRİŞ NOKTASI (MAIN ENTRYPOINT)
+# 5. UYGULAMA GİRİŞ NOKTASI (MAIN ENTRYPOINT)
 # ==============================================================================
 if __name__ == "__main__":
     # Yüksek DPI ekranlar için ölçeklendirme ayarları
